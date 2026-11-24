@@ -1,38 +1,20 @@
-# Production stack for a single VPS: Caddy (TLS) → Next.js + NestJS → PostgreSQL.
+# Production stack on the shared VPS.
 #
-#   cp .env.production.example .env.production   # fill in secrets
+# HTTPS and routing are handled by the server's existing `caddy-docker-proxy`,
+# which owns ports 80/443 and reads
+# routes from container labels on the external `proxy` network. This stack
+# publishes no ports of its own:
+#   FRONTEND_DOMAIN → frontend:3000
+#   API_DOMAIN      → backend:4000
+# PostgreSQL sits on an internal network with no route to the internet, no
+# published port and no domain: only the API (and the one-shot migrate job)
+# can reach it.
+#
+#   cp .env.production.example .env.production   # fill in the secret
 #   docker compose -f compose.prod.yaml --env-file .env.production up -d --build
-#
-# Only Caddy publishes ports. The browser talks to two domains:
-#   FRONTEND_DOMAIN  → frontend:3000
-#   API_DOMAIN       → backend:4000
-# PostgreSQL lives on an internal network with no route to the internet and
-# no published port, so it has no domain and cannot be reached from outside.
-name: chargeblast-prod
+name: chargeblast
 
 services:
-  caddy:
-    image: caddy:2.10-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    environment:
-      FRONTEND_DOMAIN: ${FRONTEND_DOMAIN:?set FRONTEND_DOMAIN}
-      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN}
-      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
-    volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      frontend:
-        condition: service_healthy
-      backend:
-        condition: service_healthy
-    networks: [edge]
-
   postgres:
     image: postgres:17.6-alpine
     restart: unless-stopped
@@ -44,10 +26,15 @@ services:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     networks: [data]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   # One-shot: apply migrations and the idempotent demo seed, then exit.
   migrate:
@@ -74,12 +61,26 @@ services:
       NODE_ENV: production
       PORT: 4000
       DATABASE_URL: postgres://${POSTGRES_USER:-chargeblast}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chargeblast}
-      CORS_ORIGIN: https://${FRONTEND_DOMAIN}
+      CORS_ORIGIN: https://${FRONTEND_DOMAIN:?set FRONTEND_DOMAIN}
       PAYMENT_CREATE_LIMIT: ${PAYMENT_CREATE_LIMIT:-3000}
     depends_on:
       migrate:
         condition: service_completed_successfully
-    networks: [edge, data]
+    networks: [proxy, data]
+    labels:
+      caddy: ${API_DOMAIN:?set API_DOMAIN}
+      caddy.reverse_proxy: "{{upstreams 4000}}"
+      caddy.encode: zstd gzip
+      # Matches the API's own 16 KB JSON limit; bigger bodies never reach Node.
+      caddy.request_body.max_size: 16KB
+      caddy.header.-Server: ""
+      caddy.header.Strict-Transport-Security: max-age=31536000; includeSubDomains
+      caddy.header.X-Content-Type-Options: nosniff
+      caddy.header.Referrer-Policy: strict-origin-when-cross-origin
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
   frontend:
     build:
@@ -87,17 +88,32 @@ services:
       target: runtime
       args:
         NEXT_PUBLIC_API_URL: https://${API_DOMAIN}/api/v1
+    image: chargeblast-frontend:prod
     restart: unless-stopped
-    networks: [edge]
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [proxy]
+    labels:
+      caddy: ${FRONTEND_DOMAIN}
+      caddy.reverse_proxy: "{{upstreams 3000}}"
+      caddy.encode: zstd gzip
+      caddy.header.-Server: ""
+      caddy.header.Strict-Transport-Security: max-age=31536000; includeSubDomains
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
 networks:
-  # Caddy ↔ apps.
-  edge:
-  # Apps ↔ PostgreSQL only; `internal` blocks any traffic to or from outside.
+  # Shared with caddy-docker-proxy (it routes every project on the server).
+  proxy:
+    external: true
+  # API ↔ PostgreSQL only; `internal` blocks any traffic to or from outside.
   data:
+    name: chargeblast_data
     internal: true
 
 volumes:
   pgdata:
-  caddy_data:
-  caddy_config:
+    name: chargeblast_pgdata
