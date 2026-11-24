@@ -1,0 +1,103 @@
+# Production stack for a single VPS: Caddy (TLS) → Next.js + NestJS → PostgreSQL.
+#
+#   cp .env.production.example .env.production   # fill in secrets
+#   docker compose -f compose.prod.yaml --env-file .env.production up -d --build
+#
+# Only Caddy publishes ports. The browser talks to two domains:
+#   FRONTEND_DOMAIN  → frontend:3000
+#   API_DOMAIN       → backend:4000
+# PostgreSQL lives on an internal network with no route to the internet and
+# no published port, so it has no domain and cannot be reached from outside.
+name: chargeblast-prod
+
+services:
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      FRONTEND_DOMAIN: ${FRONTEND_DOMAIN:?set FRONTEND_DOMAIN}
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks: [edge]
+
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-chargeblast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-chargeblast}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [data]
+
+  # One-shot: apply migrations and the idempotent demo seed, then exit.
+  migrate:
+    build:
+      context: ${BACKEND_PATH:-../chargeblast-backend}
+      target: runtime
+    image: chargeblast-backend:prod
+    command: ["sh", "-c", "node dist/database/cli/migrate.js && node dist/database/cli/seed.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-chargeblast}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chargeblast}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [data]
+
+  backend:
+    build:
+      context: ${BACKEND_PATH:-../chargeblast-backend}
+      target: runtime
+    image: chargeblast-backend:prod
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgres://${POSTGRES_USER:-chargeblast}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chargeblast}
+      CORS_ORIGIN: https://${FRONTEND_DOMAIN}
+      PAYMENT_CREATE_LIMIT: ${PAYMENT_CREATE_LIMIT:-3000}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [edge, data]
+
+  frontend:
+    build:
+      context: ${FRONTEND_PATH:-../chargeblast-frontend}
+      target: runtime
+      args:
+        NEXT_PUBLIC_API_URL: https://${API_DOMAIN}/api/v1
+    restart: unless-stopped
+    networks: [edge]
+
+networks:
+  # Caddy ↔ apps.
+  edge:
+  # Apps ↔ PostgreSQL only; `internal` blocks any traffic to or from outside.
+  data:
+    internal: true
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

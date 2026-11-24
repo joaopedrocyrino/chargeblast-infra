@@ -1,0 +1,79 @@
+# Local development stack: PostgreSQL + NestJS API + Next.js frontend.
+# Both application services run in watch mode with the source bind-mounted,
+# so edits on the host hot-reload inside the containers.
+#
+#   docker compose up --build        # http://localhost:3000
+#
+name: ${COMPOSE_PROJECT_NAME:-chargeblast}
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-chargeblast}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-chargeblast}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: ${BACKEND_PATH:-../chargeblast-backend}
+      target: dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 4000
+      DATABASE_URL: postgres://${POSTGRES_USER:-chargeblast}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chargeblast}
+      SEED_ON_START: ${SEED_ON_START:-true}
+      PAYMENT_CREATE_LIMIT: ${PAYMENT_CREATE_LIMIT:-3000}
+      CORS_ORIGIN: http://localhost:${FRONTEND_HOST_PORT:-3000}
+    ports:
+      - "127.0.0.1:${BACKEND_HOST_PORT:-4000}:4000"
+    volumes:
+      - ${BACKEND_PATH:-../chargeblast-backend}:/app
+      - backend_node_modules:/app/node_modules
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/v1/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ${FRONTEND_PATH:-../chargeblast-frontend}
+      target: dev
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      # Server-side target for the Next.js `/api/v1/*` rewrite.
+      BACKEND_INTERNAL_URL: http://backend:4000
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-3000}:3000"
+    volumes:
+      - ${FRONTEND_PATH:-../chargeblast-frontend}:/app
+      - frontend_node_modules:/app/node_modules
+      - frontend_next:/app/.next
+
+volumes:
+  pgdata:
+  backend_node_modules:
+  frontend_node_modules:
+  frontend_next:
